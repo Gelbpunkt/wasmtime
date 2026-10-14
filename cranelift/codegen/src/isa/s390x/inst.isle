@@ -218,7 +218,6 @@
 
     ;; An atomic read-modify-write operation with a memory in-/out operand,
     ;; a register destination, and a register source.
-    ;; a memory source.
     (AtomicRmw
       (alu_op ALUOp)
       (rd WritableReg)
@@ -237,6 +236,13 @@
       (rd WritableReg)
       (ri Reg)
       (rn Reg)
+      (mem MemArg))
+
+    ;; A 128-bit atomic compare-and-swap operation.
+    (AtomicCas128
+      (rd WritableRegPair)
+      (ri RegPair)
+      (rn RegPair)
       (mem MemArg))
 
     ;; A memory fence operation.
@@ -2353,6 +2359,13 @@
             (_ Unit (emit (MInst.AtomicCas64 dst src1 src2 mem))))
         dst))
 
+;; Helper for emitting `MInst.AtomicCas128` instructions.
+(decl atomic_cas128 (RegPair RegPair MemArg) RegPair)
+(rule (atomic_cas128 src1 src2 mem)
+      (let ((dst WritableRegPair (temp_writable_regpair $I64))
+            (_ Unit (emit (MInst.AtomicCas128 dst src1 src2 mem))))
+        dst))
+
 ;; Helper for emitting `MInst.Fence` instructions.
 (decl fence_impl () SideEffectNoResult)
 (rule (fence_impl)
@@ -2817,6 +2830,13 @@
             (_ Unit (emit (MInst.VecExtractLane size dst src lane_imm lane_reg))))
         dst))
 
+;; Helper for emitting `MInst.VecExtractLane` instructions.
+(decl vec_extract_lane_writable (Type Reg u8 Reg) WritableReg)
+(rule (vec_extract_lane_writable (multi_lane size _) src lane_imm lane_reg)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.VecExtractLane size dst src lane_imm lane_reg))))
+        dst))
+
 ;; Helper for emitting `MInst.VecInsertLaneImm` instructions.
 (decl vec_insert_lane_imm (Type Reg i16 u8) Reg)
 (rule (vec_insert_lane_imm ty @ (multi_lane size _) src imm lane_imm)
@@ -2983,6 +3003,20 @@
       (let ((_ Unit (inst_builder_push ib (MInst.AtomicCas64 dst_src1 dst_src1 src2 mem))))
         dst_src1))
 
+;; Push a `MInst.AtomicCas128` instruction to a sequence.
+(decl push_atomic_cas128 (VecMInstBuilder WritableReg Reg MemArg) Reg)
+(rule (push_atomic_cas128 ib (real_reg dst_src1) src2 mem)
+      ;; This is where we move the data from VR to pairs of GPRs
+      ;; in order to perform the atomic compare-and-swap
+      (let ((dst_src1_pair WritableRegPair (writable_vr_to_regpair dst_src1))
+            (_ Unit (inst_builder_push ib (MInst.AtomicCas128
+                                              dst_src1_pair
+                                              dst_src1_pair
+                                              (vr_to_regpair src2)
+                                              mem))))
+        ;; Afterwards, we need to move the data back from GPRs to VRs
+        (regpair_to_vr dst_src1_pair)))
+
 ;; Push instructions to break out of the loop if condition is met.
 (decl push_break_if (VecMInstBuilder ProducesFlags Cond) Reg)
 (rule (push_break_if ib (ProducesFlags.ProducesFlagsSideEffect inst) cond)
@@ -3015,6 +3049,8 @@
       (emit (MInst.Load32 dst addr)))
 (rule (emit_load $I64 dst addr)
       (emit (MInst.Load64 dst addr)))
+(rule (emit_load $I128 dst addr)
+      (emit (MInst.VecLoad dst addr)))
 
 ;; Helper for creating `MInst.MovPReg` instructions.
 (decl mov_preg (PReg) Reg)
@@ -3176,6 +3212,7 @@
 (rule (ty_ext32 $I16) $I32)
 (rule (ty_ext32 $I32) $I32)
 (rule (ty_ext32 $I64) $I64)
+(rule (ty_ext32 $I128) $I128)
 
 ;; Result type of extending integer `Type` to 64 bits if smaller.
 (decl ty_ext64 (Type) Type)
@@ -3511,6 +3548,9 @@
 ;; copied out of the hard register.  In the little-endian case, we need to
 ;; byte-swap since the compare-and-swap instruction is always big-endian.
 (decl casloop_result (Type MemFlagsData PReg) Reg)
+(rule 2 (casloop_result $I128 (bigendian) result)
+      ;; FIXME: Definitely wrong
+      (mov_preg result))
 (rule 1 (casloop_result (ty_32_or_64 ty) (bigendian) result)
       (mov_preg result))
 (rule (casloop_result (ty_32_or_64 ty) (littleendian) result)
@@ -4727,6 +4767,7 @@
 (decl push_atomic_cas (VecMInstBuilder Type WritableReg Reg MemArg) Reg)
 (rule (push_atomic_cas ib $I32 src1 src2 mem) (push_atomic_cas32 ib src1 src2 mem))
 (rule (push_atomic_cas ib $I64 src1 src2 mem) (push_atomic_cas64 ib src1 src2 mem))
+(rule (push_atomic_cas ib $I128 src1 src2 mem) (push_atomic_cas128 ib src1 src2 mem))
 
 
 ;; Helpers for generating `fadd` instructions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
