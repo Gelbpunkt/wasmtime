@@ -3500,20 +3500,34 @@
 
 ;; Atomic operations that require a compare-and-swap loop.
 
+;; Operations for 128-bit types use a compare-and-swap loop.
+(rule -1 (lower (atomic_rmw $I128 (mem_flags_data flags) op addr src))
+      ;; src is 128-bit, so it is stored in a VR.
+      (let ((src_reg Reg (put_in_reg src))
+            (addr_reg Reg (put_in_reg addr))
+	    (val_reg WritableReg (casloop_val_reg $I128))
+            ;; Create body of compare-and-swap loop.
+            (ib VecMInstBuilder (inst_builder_new))
+            (val0 Reg (writable_reg_to_reg val_reg))
+            (val1 Reg (atomic_rmw_body ib $I128 flags op
+                        (casloop_tmp_reg $I128) val0 src_reg)))
+        ;; Emit compare-and-swap loop and extract final result.
+        (casloop ib $I128 flags val_reg addr_reg val1)))
+
 ;; Operations for 32/64-bit types can use a fullword compare-and-swap loop.
-(rule -1 (lower (atomic_rmw (ty_32_or_64 ty) (mem_flags_data flags) op addr src))
+(rule -2 (lower (atomic_rmw (ty_32_or_64 ty) (mem_flags_data flags) op addr src))
       (let ((src_reg Reg (put_in_reg src))
             (addr_reg Reg (put_in_reg addr))
             ;; Create body of compare-and-swap loop.
             (ib VecMInstBuilder (inst_builder_new))
-            (val0 Reg (writable_reg_to_reg (casloop_val_reg)))
+            (val0 Reg (writable_reg_to_reg (casloop_val_reg ty)))
             (val1 Reg (atomic_rmw_body ib ty flags op
-                        (casloop_tmp_reg) val0 src_reg)))
+                        (casloop_tmp_reg ty) val0 src_reg)))
         ;; Emit compare-and-swap loop and extract final result.
-        (casloop ib ty flags addr_reg val1)))
+        (casloop ib ty flags (casloop_val_reg ty) addr_reg val1)))
 
 ;; Operations for 8/16-bit types must operate on the surrounding aligned word.
-(rule -2 (lower (atomic_rmw (ty_8_or_16 ty) (mem_flags_data flags) op addr src))
+(rule -3 (lower (atomic_rmw (ty_8_or_16 ty) (mem_flags_data flags) op addr src))
       (let ((src_reg Reg (put_in_reg src))
             (addr_reg Reg (put_in_reg addr))
             ;; Prepare access to surrounding aligned word.
@@ -3521,17 +3535,23 @@
             (aligned_addr Reg (casloop_aligned_addr addr_reg))
             ;; Create body of compare-and-swap loop.
             (ib VecMInstBuilder (inst_builder_new))
-            (val0 Reg (writable_reg_to_reg (casloop_val_reg)))
-            (val1 Reg (casloop_rotate_in ib ty flags bitshift val0))
+            (val0 Reg (writable_reg_to_reg (casloop_val_reg ty)))
+            (val1 Reg (casloop_rotate_in ib ty flags (casloop_tmp_reg $I32) bitshift val0))
             (val2 Reg (atomic_rmw_body ib ty flags op
-                        (casloop_tmp_reg) val1 src_reg))
-            (val3 Reg (casloop_rotate_out ib ty flags bitshift val2)))
+                        (casloop_tmp_reg ty) val1 src_reg))
+            (val3 Reg (casloop_rotate_out ib ty flags (casloop_tmp_reg $I32) bitshift val2)))
         ;; Emit compare-and-swap loop and extract final result.
-        (casloop_subword ib ty flags aligned_addr bitshift val3)))
+        (casloop_subword ib ty flags (casloop_val_reg ty) aligned_addr bitshift val3)))
 
 ;; Loop bodies for atomic read-modify-write operations.
 (decl atomic_rmw_body (VecMInstBuilder Type MemFlagsData AtomicRmwOp
                        WritableReg Reg Reg) Reg)
+
+;; Loop body for 128-bit atomic XCHG operation.
+;; Simply use the source as new target value.
+(rule 3 (atomic_rmw_body ib $I128 (bigendian)
+                       (AtomicRmwOp.Xchg) tmp val src)
+      src)
 
 ;; Loop bodies for 32-/64-bit atomic XCHG operations.
 ;; Simply use the source (possibly byte-swapped) as new target value.
@@ -3716,6 +3736,13 @@
             (src_lo Reg (vec_extract_lane $I64X2 src 1 (zero_reg))))
        (regpair src_hi src_lo)))
 
+;; Helper to move a 128-bit value from a writable VR to a WritableRegPair of GPRs
+(decl writable_vr_to_regpair (WritableReg) WritableRegPair)
+(rule (writable_vr_to_regpair src)
+      (let ((src_hi WritableReg (vec_extract_lane_writable $I64X2 src 0 (zero_reg)))
+            (src_lo WritableReg (vec_extract_lane_writable $I64X2 src 1 (zero_reg))))
+       (writable_regpair src_hi src_lo)))
+
 ;; Helper to move a 128-bit Value into a RegPair
 (decl i128_to_regpair (Value) RegPair)
 (rule (i128_to_regpair val)
@@ -3754,13 +3781,13 @@
             (aligned_addr Reg (casloop_aligned_addr addr_reg))
             ;; Create body of compare-and-swap loop.
             (ib VecMInstBuilder (inst_builder_new))
-            (val0 Reg (writable_reg_to_reg (casloop_val_reg)))
-            (val1 Reg (casloop_rotate_in ib ty flags bitshift val0))
+            (val0 Reg (writable_reg_to_reg (casloop_val_reg ty)))
+            (val1 Reg (casloop_rotate_in ib ty flags (casloop_tmp_reg ty) bitshift val0))
             (val2 Reg (atomic_cas_body ib ty flags
-                        (casloop_tmp_reg) val1 src1_reg src2_reg))
-            (val3 Reg (casloop_rotate_out ib ty flags bitshift val2)))
+                        (casloop_tmp_reg ty) val1 src1_reg src2_reg))
+            (val3 Reg (casloop_rotate_out ib ty flags (casloop_tmp_reg ty) bitshift val2)))
         ;; Emit compare-and-swap loop and extract final result.
-        (casloop_subword ib ty flags aligned_addr bitshift val3)))
+        (casloop_subword ib ty flags (casloop_val_reg ty) aligned_addr bitshift val3)))
 
 ;; Emit loop body instructions to perform a subword compare-and-swap.
 (decl atomic_cas_body (VecMInstBuilder Type MemFlagsData

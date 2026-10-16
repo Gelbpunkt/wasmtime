@@ -218,7 +218,6 @@
 
     ;; An atomic read-modify-write operation with a memory in-/out operand,
     ;; a register destination, and a register source.
-    ;; a memory source.
     (AtomicRmw
       (alu_op ALUOp)
       (rd WritableReg)
@@ -2831,6 +2830,13 @@
             (_ Unit (emit (MInst.VecExtractLane size dst src lane_imm lane_reg))))
         dst))
 
+;; Helper for emitting `MInst.VecExtractLane` instructions.
+(decl vec_extract_lane_writable (Type Reg u8 Reg) WritableReg)
+(rule (vec_extract_lane_writable (multi_lane size _) src lane_imm lane_reg)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.VecExtractLane size dst src lane_imm lane_reg))))
+        dst))
+
 ;; Helper for emitting `MInst.VecInsertLaneImm` instructions.
 (decl vec_insert_lane_imm (Type Reg i16 u8) Reg)
 (rule (vec_insert_lane_imm ty @ (multi_lane size _) src imm lane_imm)
@@ -2997,6 +3003,57 @@
       (let ((_ Unit (inst_builder_push ib (MInst.AtomicCas64 dst_src1 dst_src1 src2 mem))))
         dst_src1))
 
+;; Push a `MInst.AtomicCas128` instruction to a sequence.
+;; TODO: This could potentially be refactored to not perform the moves from/to VRs
+;; and instead take RegPairs as parameters, but I believe that makes the calling
+;; side much more complicated.
+;; FIXME: We are violating SSA rules left and right here and I'm not sure how to fix
+;; that. Probably impossible without hardwiring some registers
+(decl push_atomic_cas128 (VecMInstBuilder WritableReg Reg MemArg) Reg)
+(rule (push_atomic_cas128 ib src1 src2 mem)
+      (let ((src1_pair WritableRegPair (temp_writable_regpair $I64))
+            (src2_pair WritableRegPair (temp_writable_regpair $I64))
+            (dst WritableRegPair (temp_writable_regpair $I64))
+            (out WritableReg (temp_writable_reg $I128))
+            ;; This is where we move the data from VR to pairs of GPRs
+            ;; in order to perform the atomic compare-and-swap
+            (_ Unit (inst_builder_push ib (MInst.VecExtractLane
+                                              64
+                                              (writable_regpair_hi src1_pair)
+                                              src1
+                                              0
+                                              (zero_reg))))
+            (_ Unit (inst_builder_push ib (MInst.VecExtractLane
+                                              64
+                                              (writable_regpair_lo src1_pair)
+                                              src1
+                                              1
+                                              (zero_reg))))
+            (_ Unit (inst_builder_push ib (MInst.VecExtractLane
+                                              64
+                                              (writable_regpair_hi src2_pair)
+                                              src2
+                                              0
+                                              (zero_reg))))
+            (_ Unit (inst_builder_push ib (MInst.VecExtractLane
+                                              64
+                                              (writable_regpair_lo src2_pair)
+                                              src2
+                                              1
+                                              (zero_reg))))
+            ;; Perform the compare-and-swap
+            (_ Unit (inst_builder_push ib (MInst.AtomicCas128
+                                              dst
+                                              src1_pair
+                                              src2_pair
+                                              mem)))
+            ;; Afterwards, we need to move the data back from GPRs to VRs
+            (_ Unit (inst_builder_push ib (MInst.MovToVec128
+                                              out
+                                              (regpair_hi dst)
+                                              (regpair_lo dst)))))
+        out))
+
 ;; Push instructions to break out of the loop if condition is met.
 (decl push_break_if (VecMInstBuilder ProducesFlags Cond) Reg)
 (rule (push_break_if ib (ProducesFlags.ProducesFlagsSideEffect inst) cond)
@@ -3029,6 +3086,8 @@
       (emit (MInst.Load32 dst addr)))
 (rule (emit_load $I64 dst addr)
       (emit (MInst.Load64 dst addr)))
+(rule (emit_load $I128 dst addr)
+      (emit (MInst.VecLoad dst addr)))
 
 ;; Helper for creating `MInst.MovPReg` instructions.
 (decl mov_preg (PReg) Reg)
@@ -3190,6 +3249,7 @@
 (rule (ty_ext32 $I16) $I32)
 (rule (ty_ext32 $I32) $I32)
 (rule (ty_ext32 $I64) $I64)
+(rule (ty_ext32 $I128) $I128)
 
 ;; Result type of extending integer `Type` to 64 bits if smaller.
 (decl ty_ext64 (Type) Type)
@@ -3488,12 +3548,14 @@
 ;; registers %r0 and %r1 in compare-and-swap loops.
 
 ;; %r0 always holds the value currently loaded from the memory location.
-(decl casloop_val_reg () WritableReg)
-(rule (casloop_val_reg) (writable_gpr 0))
+(decl casloop_val_reg (Type) WritableReg)
+(rule 1 (casloop_val_reg $I128) (temp_writable_reg $I128))
+(rule (casloop_val_reg ty) (writable_gpr 0))
 
 ;; %r1 is available to compute the new value to be written.
-(decl casloop_tmp_reg () WritableReg)
-(rule (casloop_tmp_reg) (writable_gpr 1))
+(decl casloop_tmp_reg (Type) WritableReg)
+(rule 1 (casloop_tmp_reg $I128) (temp_writable_reg $I128))
+(rule (casloop_tmp_reg ty) (writable_gpr 1))
 
 ;; This takes a loop body for a compare-and-swap loop, completes it by
 ;; adding the actual compare-and-swap instruction, and emits the initial
@@ -3501,39 +3563,35 @@
 ;; be written if the memory location still holds the old value in %r0.
 ;; The result should be passed to "casloop_result" or (in the case of
 ;; subword loops) to "casloop_rotate_result".
-(decl casloop_emit (VecMInstBuilder Type MemFlagsData Reg Reg) PReg)
-(rule (casloop_emit ib ty flags aligned_addr val)
+(decl casloop_emit (VecMInstBuilder Type MemFlagsData WritableReg Reg Reg) Reg)
+(rule (casloop_emit ib ty flags cas_val_reg aligned_addr val)
       (let (
             ;; Construct a memory argument for the aligned word.
             (aligned_mem MemArg (memarg_reg_plus_off aligned_addr 0 0 flags))
             ;; Add the compare-and-swap instruction to the builder.
             (result Reg (push_atomic_cas ib (ty_ext32 ty)
-                          (casloop_val_reg) val aligned_mem))
+                          cas_val_reg val aligned_mem))
             ;; Emit initial load followed by compare-and-swap loop.
-            (_ Unit (emit_load (ty_ext32 ty) (casloop_val_reg) aligned_mem))
+            (_ Unit (emit_load (ty_ext32 ty) cas_val_reg aligned_mem))
             (_ Unit (emit_loop ib (intcc_as_cond (IntCC.NotEqual)))))
-
-        ;; push_atomic_cas above returns its destination register argument,
-        ;; cas_loop_val_reg, as its result. As cas_loop_val_reg is a writable
-        ;; version of `gpr 0`, we return that directly here as a physical
-        ;; register to avoid accidentally using it with a non-preg move
-        ;; instruction.
-        (preg_gpr_0)))
+        result))
 
 ;; Compute the previous memory value after a (fullword) compare-and-swap loop.
 ;; In the big-endian case, the value is already correct, but may need to be
 ;; copied out of the hard register.  In the little-endian case, we need to
 ;; byte-swap since the compare-and-swap instruction is always big-endian.
-(decl casloop_result (Type MemFlagsData PReg) Reg)
+(decl casloop_result (Type MemFlagsData Reg) Reg)
+(rule 2 (casloop_result $I128 (bigendian) result)
+      result)
 (rule 1 (casloop_result (ty_32_or_64 ty) (bigendian) result)
-      (mov_preg result))
+      result)
 (rule (casloop_result (ty_32_or_64 ty) (littleendian) result)
-      (bswap_reg ty (preg_to_reg result)))
+      (bswap_reg ty result))
 
 ;; Emit a fullword compare-and-swap loop, returning the previous memory value.
-(decl casloop (VecMInstBuilder Type MemFlagsData Reg Reg) Reg)
-(rule (casloop ib ty flags aligned_addr val)
-      (casloop_result ty flags (casloop_emit ib ty flags aligned_addr val)))
+(decl casloop (VecMInstBuilder Type MemFlagsData WritableReg Reg Reg) Reg)
+(rule (casloop ib ty flags cas_val aligned_addr val)
+      (casloop_result ty flags (casloop_emit ib ty flags cas_val aligned_addr val)))
 
 ;; For types smaller than $I32, we have no native compare-and-swap
 ;; instruction, so we need to perform the compare-and-swap loop on the
@@ -3561,26 +3619,26 @@
 ;; (This is somewhat arbitrary but chosen to allow the most efficient
 ;; sequences to compute the various atomic operations.)
 ;; Note that $I8 accesses always use the big-endian case.
-(decl casloop_rotate_in (VecMInstBuilder Type MemFlagsData Reg Reg) Reg)
-(rule (casloop_rotate_in ib $I8 _ bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 0 bitshift))
-(rule 1 (casloop_rotate_in ib $I16 (bigendian) bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 0 bitshift))
-(rule (casloop_rotate_in ib $I16 (littleendian) bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 16 bitshift))
+(decl casloop_rotate_in (VecMInstBuilder Type MemFlagsData WritableReg Reg Reg) Reg)
+(rule (casloop_rotate_in ib $I8 _ tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 0 bitshift))
+(rule 1 (casloop_rotate_in ib $I16 (bigendian) tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 0 bitshift))
+(rule (casloop_rotate_in ib $I16 (littleendian) tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 16 bitshift))
 
 ;; The inverse operation: rotate values back to the original memory order.
 ;; This can be done by simply using the negated shift count.  As an extra
 ;; optimization, we note that in the $I16 case the shift count can only
 ;; take the values 0 or 16, both of which negate to themselves (mod 32),
 ;; so the explicit negation operation can be omitted here.
-(decl casloop_rotate_out (VecMInstBuilder Type MemFlagsData Reg Reg) Reg)
-(rule (casloop_rotate_out ib $I8 _ bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 0 (neg_reg $I32 bitshift)))
-(rule 1 (casloop_rotate_out ib $I16 (bigendian) bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 0 bitshift))
-(rule (casloop_rotate_out ib $I16 (littleendian) bitshift val)
-      (push_rot_imm_reg ib $I32 (casloop_tmp_reg) val 16 bitshift))
+(decl casloop_rotate_out (VecMInstBuilder Type MemFlagsData WritableReg Reg Reg) Reg)
+(rule (casloop_rotate_out ib $I8 _ tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 0 (neg_reg $I32 bitshift)))
+(rule 1 (casloop_rotate_out ib $I16 (bigendian) tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 0 bitshift))
+(rule (casloop_rotate_out ib $I16 (littleendian) tmp_reg bitshift val)
+      (push_rot_imm_reg ib $I32 tmp_reg val 16 bitshift))
 
 ;; Compute the previous memory value after a subword compare-and-swap loop.
 ;; This is similar to casloop_rotate_in, but brings the value to the *low*
@@ -3598,10 +3656,10 @@
       (bswap_reg $I32 (rot_reg $I32 result bitshift)))
 
 ;; Emit a subword compare-and-swap loop, returning the previous memory value.
-(decl casloop_subword (VecMInstBuilder Type MemFlagsData Reg Reg Reg) Reg)
-(rule (casloop_subword ib ty flags aligned_addr bitshift val)
+(decl casloop_subword (VecMInstBuilder Type MemFlagsData WritableReg Reg Reg Reg) Reg)
+(rule (casloop_subword ib ty flags cas_val aligned_addr bitshift val)
       (casloop_rotate_result ty flags bitshift
-        (casloop_emit ib ty flags aligned_addr val)))
+        (casloop_emit ib ty flags cas_val aligned_addr val)))
 
 
 ;; Helpers for generating `call` instructions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -4741,6 +4799,7 @@
 (decl push_atomic_cas (VecMInstBuilder Type WritableReg Reg MemArg) Reg)
 (rule (push_atomic_cas ib $I32 src1 src2 mem) (push_atomic_cas32 ib src1 src2 mem))
 (rule (push_atomic_cas ib $I64 src1 src2 mem) (push_atomic_cas64 ib src1 src2 mem))
+(rule (push_atomic_cas ib $I128 src1 src2 mem) (push_atomic_cas128 ib src1 src2 mem))
 
 
 ;; Helpers for generating `fadd` instructions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
